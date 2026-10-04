@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <memory>
+#include <cstdlib>
+#include "driver/gpio.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +33,9 @@ using namespace esp_usb;
 #define AP_CHANNEL   6
 #define TCP_PORT     23
 #define GRBL_BAUD    115200
+#define AIR_GPIO         4     // avoid 0,3,45,46 (strapping), 19/20 (USB), 26-32, 43/44
+#define AIR_ACTIVE_HIGH  1     // 1: GPIO high = air on
+#define AIR_M7_TOO       1     // also treat M7 as "air on"
 // ---------------------------------------------------------------------------
 
 static const char *TAG = "grbl_bridge";
@@ -40,6 +45,102 @@ static SemaphoreHandle_t g_vcp_lock;            // protects g_vcp
 static SemaphoreHandle_t g_disconnect_sem;      // given when the laser is unplugged
 static StreamBufferHandle_t g_usb_rx;           // laser -> TCP
 static volatile int g_client = -1;              // current TCP client socket
+static volatile bool g_air_off_pending = false;
+
+static inline void air_set(bool on)
+{
+    gpio_set_level((gpio_num_t)AIR_GPIO, (on == (AIR_ACTIVE_HIGH != 0)) ? 1 : 0);
+}
+
+static void air_init()
+{
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << AIR_GPIO;
+    io.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&io);
+    air_set(false);
+}
+
+static void handle_gcode_line(const char *line)
+{
+    bool in_paren = false;
+    for (const char *p = line; *p; ++p) {
+        char c = *p;
+        if (in_paren) { if (c == ')') in_paren = false; continue; }
+        if (c == '(') { in_paren = true; continue; }
+        if (c == ';') break;
+        if (c == 'M' || c == 'm') {
+            char *end;
+            long v = strtol(p + 1, &end, 10);
+            if (end == p + 1) continue;
+            if (v == 8 || (AIR_M7_TOO && v == 7)) {
+                g_air_off_pending = false;
+                air_set(true);
+                ESP_LOGI(TAG, "Air assist ON");
+            } else if (v == 9) {
+                g_air_off_pending = true;     // switch off once GRBL is idle
+            }
+            p = end - 1;
+        }
+    }
+}
+
+static char   g_line[160];
+static size_t g_line_len = 0;
+static bool   g_line_overflow = false;
+
+static void gcode_reset()
+{
+    g_line_len = 0;
+    g_line_overflow = false;
+}
+
+// Called with every byte block that goes client -> laser.
+static void gcode_feed(const uint8_t *d, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = d[i];
+        if (c == 0x18) {                       // GRBL soft reset: stop everything
+            g_air_off_pending = false;
+            air_set(false);
+            gcode_reset();
+            continue;
+        }
+        if (c == '?' || c == '!' || c == '~') continue;   // real-time chars
+        if (c == '\n' || c == '\r') {
+            if (g_line_len && !g_line_overflow) {
+                g_line[g_line_len] = 0;
+                handle_gcode_line(g_line);
+            }
+            gcode_reset();
+            continue;
+        }
+        if (g_line_len < sizeof(g_line) - 1) g_line[g_line_len++] = c;
+        else g_line_overflow = true;
+    }
+}
+
+// Called with every byte block that comes laser -> client.
+// Looks for "<Idle" in status reports to finish a pending air-off.
+static void scan_for_idle(const uint8_t *d, size_t n)
+{
+    static const char pat[] = "<Idle";
+    static size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (d[i] == (uint8_t)pat[m]) {
+            if (++m == sizeof(pat) - 1) {
+                m = 0;
+                if (g_air_off_pending) {
+                    g_air_off_pending = false;
+                    air_set(false);
+                    ESP_LOGI(TAG, "Air assist OFF");
+                }
+            }
+        } else {
+            m = (d[i] == '<') ? 1 : 0;
+        }
+    }
+}
 
 // ---- USB callbacks ---------------------------------------------------------
 static void usb_event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
@@ -50,6 +151,8 @@ static void usb_event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_
         break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
         ESP_LOGW(TAG, "Laser unplugged");
+        g_air_off_pending = false;                 // <-- added
+        air_set(false);                            // <-- added
         xSemaphoreGive(g_disconnect_sem);
         break;
     default:
@@ -60,6 +163,7 @@ static void usb_event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_
 static bool usb_rx_cb(const uint8_t *data, size_t len, void *user_arg)
 {
     // Keep this fast. Drop data if the buffer is full.
+    scan_for_idle(data, len);  
     xStreamBufferSend(g_usb_rx, data, len, 0);
     return true;
 }
@@ -167,6 +271,7 @@ static void tcp_server_task(void *arg)
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 
         g_client = fd;
+        gcode_reset();
         ESP_LOGI(TAG, "Client connected");
 
         uint8_t buf[256];
@@ -177,9 +282,12 @@ static void tcp_server_task(void *arg)
                 g_vcp->tx_blocking(buf, n, 500);
             }
             xSemaphoreGive(g_vcp_lock);
+            gcode_feed(buf, n);  
         }
 
         g_client = -1;
+        g_air_off_pending = false;                 // <-- added
+        air_set(false); 
         close(fd);
         ESP_LOGI(TAG, "Client disconnected");
     }
@@ -219,7 +327,7 @@ extern "C" void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
-
+    air_init();
     g_vcp_lock = xSemaphoreCreateMutex();
     g_disconnect_sem = xSemaphoreCreateBinary();
     g_usb_rx = xStreamBufferCreate(4096, 1);

@@ -1,0 +1,146 @@
+// 1. Includes (add)
+#include <cstdlib>
+#include "driver/gpio.h"
+
+// 2. Settings, after GRBL_BAUD (add)
+// Air assist output (GRBL M8 flood / M9 off; M7 mist optional)
+#define AIR_GPIO         4     // avoid 0,3,45,46 (strapping), 19/20 (USB), 26-32, 43/44
+#define AIR_ACTIVE_HIGH  1     // 1: GPIO high = air on
+#define AIR_M7_TOO       1     // also treat M7 as "air on"
+
+// 3. New block, right after "static volatile int g_client = -1;"
+static volatile bool g_air_off_pending = false;
+
+static inline void air_set(bool on)
+{
+    gpio_set_level((gpio_num_t)AIR_GPIO, (on == (AIR_ACTIVE_HIGH != 0)) ? 1 : 0);
+}
+
+static void air_init()
+{
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << AIR_GPIO;
+    io.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&io);
+    air_set(false);
+}
+
+static void handle_gcode_line(const char *line)
+{
+    bool in_paren = false;
+    for (const char *p = line; *p; ++p) {
+        char c = *p;
+        if (in_paren) { if (c == ')') in_paren = false; continue; }
+        if (c == '(') { in_paren = true; continue; }
+        if (c == ';') break;
+        if (c == 'M' || c == 'm') {
+            char *end;
+            long v = strtol(p + 1, &end, 10);
+            if (end == p + 1) continue;
+            if (v == 8 || (AIR_M7_TOO && v == 7)) {
+                g_air_off_pending = false;
+                air_set(true);
+                ESP_LOGI(TAG, "Air assist ON");
+            } else if (v == 9) {
+                g_air_off_pending = true;     // switch off once GRBL is idle
+            }
+            p = end - 1;
+        }
+    }
+}
+
+static char   g_line[160];
+static size_t g_line_len = 0;
+static bool   g_line_overflow = false;
+
+static void gcode_reset()
+{
+    g_line_len = 0;
+    g_line_overflow = false;
+}
+
+// Called with every byte block that goes client -> laser.
+static void gcode_feed(const uint8_t *d, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = d[i];
+        if (c == 0x18) {                       // GRBL soft reset: stop everything
+            g_air_off_pending = false;
+            air_set(false);
+            gcode_reset();
+            continue;
+        }
+        if (c == '?' || c == '!' || c == '~') continue;   // real-time chars
+        if (c == '\n' || c == '\r') {
+            if (g_line_len && !g_line_overflow) {
+                g_line[g_line_len] = 0;
+                handle_gcode_line(g_line);
+            }
+            gcode_reset();
+            continue;
+        }
+        if (g_line_len < sizeof(g_line) - 1) g_line[g_line_len++] = c;
+        else g_line_overflow = true;
+    }
+}
+
+// Called with every byte block that comes laser -> client.
+// Looks for "<Idle" in status reports to finish a pending air-off.
+static void scan_for_idle(const uint8_t *d, size_t n)
+{
+    static const char pat[] = "<Idle";
+    static size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (d[i] == (uint8_t)pat[m]) {
+            if (++m == sizeof(pat) - 1) {
+                m = 0;
+                if (g_air_off_pending) {
+                    g_air_off_pending = false;
+                    air_set(false);
+                    ESP_LOGI(TAG, "Air assist OFF");
+                }
+            }
+        } else {
+            m = (d[i] == '<') ? 1 : 0;
+        }
+    }
+}
+
+// 4. usb_rx_cb: add one line
+static bool usb_rx_cb(const uint8_t *data, size_t len, void *user_arg)
+{
+    // Keep this fast. Drop data if the buffer is full.
+    scan_for_idle(data, len);                      // <-- added
+    xStreamBufferSend(g_usb_rx, data, len, 0);
+    return true;
+}
+
+// 5. usb_event_cb, DEVICE_DISCONNECTED case: add two lines
+        ESP_LOGW(TAG, "Laser unplugged");
+        g_air_off_pending = false;                 // <-- added
+        air_set(false);                            // <-- added
+        xSemaphoreGive(g_disconnect_sem);
+
+// 6. tcp_server_task, on new client: add one line
+        g_client = fd;
+        gcode_reset();                             // <-- added
+        ESP_LOGI(TAG, "Client connected");
+
+// 7. tcp_server_task, receive loop: add one line, and add three lines at disconnect
+        while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+            xSemaphoreTake(g_vcp_lock, portMAX_DELAY);
+            if (g_vcp) {
+                g_vcp->tx_blocking(buf, n, 500);
+            }
+            xSemaphoreGive(g_vcp_lock);
+            gcode_feed(buf, n);                    // <-- added
+        }
+
+        g_client = -1;
+        g_air_off_pending = false;                 // <-- added
+        air_set(false);                            // <-- added (never leave air on without a client)
+        close(fd);
+
+// 8. app_main: add one line at the top of the setup
+    air_init();                                    // <-- added
+    g_vcp_lock = xSemaphoreCreateMutex();
