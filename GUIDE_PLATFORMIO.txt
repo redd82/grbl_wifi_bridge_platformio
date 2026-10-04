@@ -1,0 +1,146 @@
+GRBL WiFi BRIDGE FOR ESP32-S3 (PlatformIO)
+==========================================
+
+Goal: control an Acmer S1 (GRBL laser, CH340 USB-serial chip) wirelessly from
+LightBurn, without modifying the laser.
+
+  Laptop (LightBurn) --WiFi/TCP--> ESP32-S3 --USB host--> Acmer S1
+
+The ESP32-S3 runs its own WiFi access point. The laptop joins it, and LightBurn
+connects to the ESP over a raw TCP socket. The ESP simply relays bytes between
+the socket and the laser's USB serial port. The laser still does all GRBL work.
+
+This is the PlatformIO packaging of the same firmware as the ESP-IDF version.
+main.cpp is identical.
+
+
+0. WHY THE ESP-IDF FRAMEWORK, NOT ARDUINO
+-----------------------------------------
+The USB host side needs Espressif's usb_host_cdc_acm and usb_host_ch34x_vcp
+components. Those are ESP-IDF components, so this project uses
+"framework = espidf" inside PlatformIO. It is not an Arduino sketch.
+
+
+1. HARDWARE
+-----------
+Board: ESP32-S3 dev board with two USB-C ports (module ESP32-S3-N8R2:
+8 MB flash, 2 MB PSRAM).
+
+  - UART port : USB-serial chip on the board. Use for flashing, logs, power.
+  - Native USB port : wired to GPIO19 (D-) and GPIO20 (D+). The laser plugs
+    in here. Only this port can act as a USB host.
+
+To tell the ports apart: plug into one and look at the PC. A COM port from a
+bridge chip = UART port. "ESP32-S3 USB JTAG/serial" = native port.
+
+Wiring:
+  - Power and flash the ESP over the UART port.
+  - Connect the S1 to the native port with a USB-C OTG adapter
+    (USB-C to USB-A female) and the S1's normal USB cable.
+
+VBUS (5 V) caveat:
+  On most dev boards the native port's 5 V pin is an INPUT, so the board does
+  not power the laser's USB side. Try it first: the S1 controller may power its
+  own USB chip from its DC supply. If the ESP never reports "Laser connected",
+  feed 5 V to the cable's VBUS line yourself (for example with a USB breakout
+  fed from the board's 5V pin). Connect grounds together. Some boards have a
+  solder jumper for host-mode VBUS; look near the native port.
+
+Laser USB chip: the S1 shows up on Windows as "USB-Serial CH340". The firmware
+uses Espressif's CH34x host driver. To confirm which COM port is the laser,
+unplug the S1 and see which COM port disappears (the dev board's UART port may
+also be a CH340).
+
+
+2. FILES
+--------
+  platformio.ini            board, framework, flash size, monitor settings
+  CMakeLists.txt            top-level ESP-IDF project file (required by PlatformIO)
+  sdkconfig.defaults        console on UART (required), FreeRTOS tick 1000 Hz
+  src/CMakeLists.txt        component file
+  src/idf_component.yml     downloads usb_host_cdc_acm and usb_host_ch34x_vcp
+  src/main.cpp              the firmware
+
+
+3. BUILD AND FLASH
+------------------
+Install PlatformIO (VS Code extension or CLI). Open this folder as a project.
+
+  pio run                      build
+  pio run -t upload            flash
+  pio device monitor           serial monitor
+  pio run -t upload -t monitor flash and monitor in one go
+
+Flash over the UART port. The first build downloads the ESP-IDF toolchain and
+the two USB components, which takes a while.
+
+If PlatformIO picks the wrong COM port, set upload_port and monitor_port in
+platformio.ini.
+
+Settings are at the top of src/main.cpp:
+  AP_SSID     "LaserBridge"
+  AP_PASS     "change-me-please"   (change it, minimum 8 characters)
+  AP_CHANNEL  6
+  TCP_PORT    8888
+  GRBL_BAUD   115200
+
+The console must stay on UART because the native USB pins are used as USB host.
+
+
+4. TEST ORDER
+-------------
+  1. Flash. In the monitor, look for "AP 'LaserBridge' up" and
+     "Waiting for laser on USB...".
+  2. Plug the S1 into the native USB-C port. Expect "Laser connected".
+  3. Join the "LaserBridge" WiFi network from your laptop.
+  4. In LightBurn, add a device: GRBL -> WiFi/TCP connection type,
+     IP address 192.168.4.1, port 8888.
+  5. Connect and check that the laser reports status and jogs.
+
+Note: LightBurn does not auto-discover GRBL network devices. You add the IP and
+port once and the device is saved. Your laptop loses internet while joined to
+the bridge's WiFi.
+
+
+5. HOW THE FIRMWARE WORKS
+-------------------------
+  - WiFi access point, default address 192.168.4.1, power save disabled.
+  - TCP server on TCP_PORT, one client at a time, TCP_NODELAY and keepalive on.
+  - Client -> laser: bytes are written to the USB serial port immediately, so
+    GRBL real-time characters (? ! ~ 0x18) are never held back.
+  - Laser -> client: bytes from the USB callback go into a stream buffer and a
+    task sends them to the client. Data is discarded if nobody is connected.
+  - USB manager task opens the CH340, sets 115200 8N1, keeps DTR/RTS low, and
+    reopens the device if the laser is unplugged and replugged.
+  - Raw bytes only: no HTTP on the GRBL port (LightBurn cannot parse it).
+
+
+6. TROUBLESHOOTING
+------------------
+  - Component download fails: the IDF component manager needs internet on the
+    first build. Check your connection, then run "pio run" again. If it still
+    fails, download usb_host_cdc_acm and usb_host_ch34x_vcp from the Espressif
+    component registry into a "components" folder in the project root.
+  - Compile errors around VCP::open or the config struct: the USB host
+    component API changes between versions. Compare with the cdc_acm_vcp example
+    that ships with the usb_host_ch34x_vcp component.
+  - Build uses an old ESP-IDF: the code expects ESP-IDF 5.1 or newer. If your
+    PlatformIO platform ships an older IDF, update it with
+    "pio pkg update" or pin a newer espressif32 platform in platformio.ini.
+  - Never prints "Laser connected": check the VBUS caveat in section 1, the
+    adapter, and that the laser is on the NATIVE port.
+  - LightBurn says "Waiting for connection": check you joined LaserBridge,
+    the IP and port match, and use 2.4 GHz (the S3 only supports 2.4 GHz).
+  - Laser resets when LightBurn connects: DTR/RTS handling is the first thing
+    to experiment with (set_control_line_state in usb_manager_task).
+  - Garbage or no response: confirm the baud rate your normal USB setup uses
+    in LightBurn (115200 is typical for GRBL).
+
+
+7. STATUS / NOT YET DONE
+------------------------
+  - The code and the PlatformIO setup have not been compiled or tested on
+    hardware.
+  - Possible later addition: a web page on port 80 for uploading images and
+    converting them to G-code on the ESP. With only 2 MB PSRAM this will be
+    tight, so keep it separate from the GRBL port.
