@@ -252,6 +252,15 @@ static inline void set_indicator(
     );
 }
 
+static inline void toggle_power_on(
+    gpio_num_t gpio,
+    bool on,
+    int active_high)
+{
+    gpio_set_level(
+        gpio, on ? 1 : 0);
+}
+
 
 // Air enable output
 static inline void air_assist_set(bool on)
@@ -270,7 +279,7 @@ static inline void air_led_set(bool on)
 // Power-board button interface
 static inline void power_state_set(bool on)
 {
-    set_indicator((gpio_num_t)PWR_CTRL_GPIO, on, PWR_CTRL_ACTIVE_HIGH);
+    toggle_power_on((gpio_num_t)PWR_CTRL_GPIO, on, PWR_CTRL_ACTIVE_HIGH);
 }
 
 
@@ -311,9 +320,7 @@ static inline void standby_led_set(bool on)
 static void power_button_press(void)
 {
     power_state_set(true);
-
     vTaskDelay(pdMS_TO_TICKS(POWER_PRESS_MS));
-
     power_state_set(false);
 }
 
