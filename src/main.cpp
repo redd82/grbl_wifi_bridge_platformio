@@ -91,19 +91,26 @@ using namespace esp_usb;
 #define GRBL_BAUD     115200
 
 // ---- GPIO list ------------------------------------------------------------
+// ---- Button GPIOs ----------------------------------------------------------
+#define AIR_BUTTON_GPIO             13 // manual air-assist button input
+#define PWR_BUTTON_GPIO             17 // manual power button input
+#define LSR_BUTTON_GPIO             10 // manual laser button input
+#define AIR_CYCLE_UP_BUTTON_GPIO    15 // manual air-assist button input
+#define AIR_CYCLE_DOWN_BUTTON_GPIO  11 // manual power button input
+#define LIGHT_1_BUTTON_GPIO         16 // manual laser button input
+#define LIGHT_2_BUTTON_GPIO         12 // manual laser button input
+
+// ---- Control GPIOs ---------------------------------------------------------
+#define PWR_CTRL_GPIO             6 // power-board button interface
 #define AIR_GPIO                  4 // air assist digital enable output
 #define AIR_PULSED_GPIO           5 // pulsed PWM output
 
-#define PWR_CTRL_GPIO             6 // power-board button interface
-#define AIR_BUTTON_GPIO           10 // manual air-assist button input
-#define PWR_BUTTON_GPIO           13 // manual power button input
-#define LSR_BUTTON_GPIO           15 // manual laser button input
-
-#define LSR_LED_GPIO              7 // laser status LED
-#define USB_BOOT_GPIO             9  // USB LED: ON only when the link is ARMED (valid GRBL reply received)
-#define AIR_LED_GPIO              11 // air-assist status LED
-#define PWR_LED_GPIO              12 // power-board status LED
-#define STANDBY_LED_GPIO          18 // Standby LED: blinks while the USB device is present but not yet armed
+// ---- LED GPIOs -------------------------------------------------------------
+#define LSR_LED_GPIO              3 // laser status LED
+#define USB_BOOT_GPIO             4  // USB LED: ON only when the link is ARMED (valid GRBL reply received)
+#define AIR_LED_GPIO              5 // air-assist status LED
+#define PWR_LED_GPIO              6 // power-board status LED
+#define STANDBY_LED_GPIO          7 // Standby LED: blinks while the USB device is present but not yet armed
 
 // ---- Settings --------------------------------------------------------------
 #define AIR_MIN_DUTY_PCT          40 // M7 without S: duty reached at the end of the ramp
@@ -260,7 +267,6 @@ static inline void toggle_power_on(
     gpio_set_level(
         gpio, on ? 1 : 0);
 }
-
 
 // Air enable output
 static inline void air_assist_set(bool on)
@@ -1590,7 +1596,12 @@ static void gpio_init_all(void)
     const uint64_t input_mask =
         (1ULL << AIR_BUTTON_GPIO) |
         (1ULL << PWR_BUTTON_GPIO) |
-        (1ULL << LSR_BUTTON_GPIO);
+        (1ULL << LSR_BUTTON_GPIO) |
+        (1ULL << AIR_CYCLE_UP_BUTTON_GPIO) |
+        (1ULL << AIR_CYCLE_DOWN_BUTTON_GPIO) |
+        (1ULL << LIGHT_1_BUTTON_GPIO) |
+        (1ULL << LIGHT_2_BUTTON_GPIO)
+        ;
 
     gpio_config_t in = {};
 
