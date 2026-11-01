@@ -5,8 +5,8 @@
 // -----------------
 // Boot:
 //   The ESP and the power board are fed by the same PSU, so the power board
-//   is always OFF when the ESP boots. After a short delay the ESP presses the
-//   power-board button ONCE and tracks the board as ON.
+//   is always OFF when the ESP boots. After a short delay the ESP drives the
+//   power-control output high (held) and tracks the board as ON.
 //
 // USB link, three states:
 //   1. NO DEVICE   : nothing detected.            standby LED off, USB LED off
@@ -23,7 +23,7 @@
 //   always : forget half-built G-code line, laser state/LED off, air off,
 //            air PWM back to 0
 //   send_stop : hard stop to GRBL: '!' then 0x18 (real-time bytes, not queued)
-//   cut_power : press the power-board button (only if tracked state is ON)
+//   cut_power : drive the power-control output low (only if tracked state is ON)
 //
 //   Event                      send_stop   cut_power
 //   Laser button               yes         no
@@ -37,7 +37,7 @@
 // Manual controls:
 //   Power button: hold POWER_HOLD_ON_MS to switch the board ON (LED blinks
 //                 while holding, solid when reached); a short press switches
-//                 it OFF at once. Each uses a 200 ms power-board button pulse.
+//                 it OFF at once. The control output is held high while ON.
 //   Laser button: hard stop ('!' + 0x18).
 //   Air button  : toggle air assist between 40% PWM and OFF.
 //
@@ -95,10 +95,10 @@ using namespace esp_usb;
 #define AIR_BUTTON_GPIO             13 // manual air-assist button input
 #define PWR_BUTTON_GPIO             17 // manual power button input
 #define LSR_BUTTON_GPIO             10 // manual laser button input
-#define AIR_CYCLE_UP_BUTTON_GPIO    15 // manual air-assist button input
-#define AIR_CYCLE_DOWN_BUTTON_GPIO  11 // manual power button input
-#define LIGHT_1_BUTTON_GPIO         16 // manual laser button input
-#define LIGHT_2_BUTTON_GPIO         12 // manual laser button input
+#define AIR_CYCLE_UP_BUTTON_GPIO    15 // manual air-assist cycle up button input
+#define AIR_CYCLE_DOWN_BUTTON_GPIO  11 // manual air-assist cycle down button input
+#define LIGHT_1_BUTTON_GPIO         16 // manual light 1 button input
+#define LIGHT_2_BUTTON_GPIO         12 // manual light 2 button input
 
 // ---- Control GPIOs ---------------------------------------------------------
 #define PWR_CTRL_GPIO             6 // power-board button interface
@@ -106,10 +106,10 @@ using namespace esp_usb;
 #define AIR_PULSED_GPIO           5 // pulsed PWM output
 
 // ---- LED GPIOs -------------------------------------------------------------
-#define LSR_LED_GPIO              3 // laser status LED
-#define USB_BOOT_GPIO             4  // USB LED: ON only when the link is ARMED (valid GRBL reply received)
-#define AIR_LED_GPIO              5 // air-assist status LED
-#define PWR_LED_GPIO              6 // power-board status LED
+#define LSR_LED_GPIO              0 // laser status LED
+#define USB_BOOT_GPIO             1  // USB LED: ON only when the link is ARMED (valid GRBL reply received)
+#define AIR_LED_GPIO              2 // air-assist status LED
+#define PWR_LED_GPIO              3 // power-board status LED
 #define STANDBY_LED_GPIO          7 // Standby LED: blinks while the USB device is present but not yet armed
 
 // ---- Settings --------------------------------------------------------------
@@ -136,13 +136,12 @@ using namespace esp_usb;
 
 // ---- Power board -----------------------------------------------------------
 
-#define PWR_CTRL_ACTIVE_HIGH      1 // GPIO high = button pressed, Control output connected to the power-board button interface
+#define PWR_CTRL_ACTIVE_HIGH      1 // GPIO high = power board ON (level output, held while ON)
 #define PWR_LED_ACTIVE_HIGH       1 // GPIO high = LED on, Power-board status LED
 
-// Delay between ESP boot and the automatic power-on press, so rails and
-// GPIOs have settled and the press cannot be a start-up glitch.
+// Delay between ESP boot and the automatic power-on, so rails and
+// GPIOs have settled and it cannot be a start-up glitch.
 #define POWER_ON_DELAY_MS         1500
-#define POWER_PRESS_MS            200 // Length of the simulated button press
 
 // Manual power button: hold this long to switch the board ON.
 // A short press switches it OFF immediately.
@@ -265,7 +264,9 @@ static inline void toggle_power_on(
     int active_high)
 {
     gpio_set_level(
-        gpio, on ? 1 : 0);
+        gpio,
+        (on == (active_high != 0)) ? 1 : 0
+    );
 }
 
 // Air enable output
@@ -282,7 +283,7 @@ static inline void air_led_set(bool on)
 }
 
 
-// Power-board button interface
+// Power-board control output: held active while the board is ON
 static inline void power_state_set(bool on)
 {
     toggle_power_on((gpio_num_t)PWR_CTRL_GPIO, on, PWR_CTRL_ACTIVE_HIGH);
@@ -321,19 +322,9 @@ static inline void standby_led_set(bool on)
 // POWER BOARD
 // ============================================================================
 
-// Simulate a momentary button press.
-// The output is released after POWER_PRESS_MS.
-static void power_button_press(void)
-{
-    power_state_set(true);
-    vTaskDelay(pdMS_TO_TICKS(POWER_PRESS_MS));
-    power_state_set(false);
-}
-
-
-// Record the new tracked state FIRST, then press the button.
-// Setting the state before the press means a concurrent USB-loss handler
-// already sees the final state and cannot press a second time.
+// Record the new tracked state FIRST, then drive the control output.
+// Setting the state first means a concurrent USB-loss handler already sees
+// the final state and cannot switch a second time.
 // Caller must hold g_pwr_lock.
 static void power_press_locked(bool next_state)
 {
@@ -344,7 +335,7 @@ static void power_press_locked(bool next_state)
         g_last_off_tick.store(xTaskGetTickCount());
     }
 
-    power_button_press();
+    power_state_set(next_state);
 
     ESP_LOGI(
         TAG,
@@ -1079,13 +1070,14 @@ static void usb_arm_now(void)
     usb_state_set(true);
 
     // The S1 is talking over USB, so the power board is certainly ON.
-    // Correct the tracked state if it says OFF. Nothing is pressed.
+    // Correct the tracked state if it says OFF. Nothing is driven low.
     // Skipped while a power press is running or right after a commanded OFF,
     // so a late reply during shutdown cannot flip the state back to ON.
     if (!PWR_STATE.load() &&
         (xTaskGetTickCount() - g_last_off_tick.load()) >= pdMS_TO_TICKS(2000) &&
         xSemaphoreTake(g_pwr_lock, 0) == pdTRUE) {
         PWR_STATE.store(true);
+        power_state_set(true);
         power_led_set(true);
         xSemaphoreGive(g_pwr_lock);
 
