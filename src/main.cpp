@@ -98,22 +98,26 @@ using namespace esp_usb;
 #define AIR_CYCLE_UP_BUTTON_GPIO    15 // manual air-assist cycle up button input
 #define AIR_CYCLE_DOWN_BUTTON_GPIO  11 // manual air-assist cycle down button input
 #define LIGHT_1_BUTTON_GPIO         16 // manual light 1 button input
-#define LIGHT_2_BUTTON_GPIO         12 // manual light 2 button input
+#define LIGHT_2_BUTTON_GPIO         12 // manual light 2 button input (no worky due to Chinese crap buttonboard)
 
 // ---- Control GPIOs ---------------------------------------------------------
 #define PWR_CTRL_GPIO             6 // power-board button interface
 #define AIR_GPIO                  4 // air assist digital enable output
 #define AIR_PULSED_GPIO           5 // pulsed PWM output
+#define LIGHT_1_CTL               8 // lamp one control GPIO
+#define LIGHT_2_CTL               9 // lamp two control GPIO
 
 // ---- LED GPIOs -------------------------------------------------------------
 #define LSR_LED_GPIO              0 // laser status LED
-#define USB_BOOT_GPIO             1  // USB LED: ON only when the link is ARMED (valid GRBL reply received)
+#define USB_BOOT_GPIO             1 // USB LED: ON only when the link is ARMED (valid GRBL reply received)
 #define AIR_LED_GPIO              2 // air-assist status LED
 #define PWR_LED_GPIO              3 // power-board status LED
 #define STANDBY_LED_GPIO          7 // Standby LED: blinks while the USB device is present but not yet armed
 
 // ---- Settings --------------------------------------------------------------
 #define AIR_MIN_DUTY_PCT          40 // M7 without S: duty reached at the end of the ramp
+#define AIR_CYCLE_STEP_PCT        5 // Duty change per manual cycle-button press
+#define AIR_CYCLE_FADE_MS         250 // Smooth transition time for manual adjustments
 #define PULSE_RAMP_MS             5000  // M7 ramp-up time
 #define AIR_RAMP_DOWN_MS          5000  // M9 ramp-down time 
                                         // Time of the ramp-down from the current duty to AIR_MIN_DUTY_PCT.
@@ -626,6 +630,34 @@ static void Cycle_AIR_ASSIST(void)
     } else {
         air_assist_on(AIR_MIN_DUTY_PCT);
     }
+}
+
+
+static void air_assist_adjust_duty(bool increase)
+{
+    if (!AIR_STATE.load()) {
+        return;
+    }
+
+    uint32_t current_pct = pulse_current_pct();
+    uint32_t target_pct;
+
+    if (increase) {
+        target_pct = current_pct + AIR_CYCLE_STEP_PCT;
+        if (target_pct > 100) {
+            target_pct = 100;
+        }
+    } else {
+        target_pct = current_pct > AIR_CYCLE_STEP_PCT
+            ? current_pct - AIR_CYCLE_STEP_PCT
+            : 0;
+    }
+
+    pulse_fade_to(target_pct, AIR_CYCLE_FADE_MS);
+    ESP_LOGI(TAG, "Air assist duty %s: %lu%% -> %lu%%",
+             increase ? "up" : "down",
+             (unsigned long)current_pct,
+             (unsigned long)target_pct);
 }
 
 
@@ -1535,15 +1567,51 @@ static void button_task(void *arg)
     Button air_button;
     Button power_button;
     Button laser_button;
+    Button air_cycle_up_button;
+    Button air_cycle_down_button;
 
     button_init(&air_button, (gpio_num_t)AIR_BUTTON_GPIO);
     button_init(&power_button, (gpio_num_t)PWR_BUTTON_GPIO);
     button_init(&laser_button, (gpio_num_t)LSR_BUTTON_GPIO);
+    button_init(&air_cycle_up_button, (gpio_num_t)AIR_CYCLE_UP_BUTTON_GPIO);
+    button_init(&air_cycle_down_button, (gpio_num_t)AIR_CYCLE_DOWN_BUTTON_GPIO);
+
+    Button light1_button;
+    Button light2_button;
+    bool light1_on = false;
+    bool light2_on = false;
+
+    button_init(&light1_button, (gpio_num_t)LIGHT_1_BUTTON_GPIO);
+    button_init(&light2_button, (gpio_num_t)LIGHT_2_BUTTON_GPIO);
 
     while (true) {
+        if (button_pressed_event(&light1_button)) {
+            light1_on = !light1_on;
+            gpio_set_level((gpio_num_t)LIGHT_1_CTL, light1_on ? 1 : 0);
+            ESP_LOGI(TAG, "Light 1 %s", light1_on ? "ON" : "OFF");
+            // cuz the Chineboard sucks and doesn't have a proper light 2 button, toggle it here as well
+            light2_on = !light2_on;
+            gpio_set_level((gpio_num_t)LIGHT_2_CTL, light2_on ? 1 : 0);
+            ESP_LOGI(TAG, "Light 2 %s", light2_on ? "ON" : "OFF");            
+        }
+
+        if (button_pressed_event(&light2_button)) {
+            light2_on = !light2_on;
+            gpio_set_level((gpio_num_t)LIGHT_2_CTL, light2_on ? 1 : 0);
+            ESP_LOGI(TAG, "Light 2 %s", light2_on ? "ON" : "OFF");
+        }
+
         if (button_pressed_event(&air_button)) {
             ESP_LOGI(TAG, "Manual air-assist button");
             Cycle_AIR_ASSIST();
+        }
+
+        if (button_pressed_event(&air_cycle_up_button)) {
+            air_assist_adjust_duty(true);
+        }
+
+        if (button_pressed_event(&air_cycle_down_button)) {
+            air_assist_adjust_duty(false);
         }
 
         power_button_service(&power_button);
@@ -1572,7 +1640,9 @@ static void gpio_init_all(void)
         (1ULL << PWR_LED_GPIO) |
         (1ULL << LSR_LED_GPIO) |
         (1ULL << USB_BOOT_GPIO) |
-        (1ULL << STANDBY_LED_GPIO);
+        (1ULL << STANDBY_LED_GPIO) |
+        (1ULL << LIGHT_1_CTL) |
+        (1ULL << LIGHT_2_CTL);
 
     gpio_config_t out = {};
 
@@ -1606,6 +1676,8 @@ static void gpio_init_all(void)
     ESP_ERROR_CHECK(gpio_config(&in));
 
     // Start in safe output states.
+    gpio_set_level((gpio_num_t)LIGHT_1_CTL, 0);
+    gpio_set_level((gpio_num_t)LIGHT_2_CTL, 0);
     air_assist_set(false);
     power_state_set(false);
 
